@@ -62,6 +62,9 @@ function erroSupabase(e){
   if(m.includes('não está mais recebendo')) return 'Essa vaga acabou de ser preenchida. Escolha outra turma.';
   if(m.includes('duplicate key') && m.includes('sugestao')) return 'Esse nome já foi sugerido.';
   if(m.includes('insufficient_privilege') || m.includes('Sem acesso')) return 'Você não tem acesso a isso.';
+  if(m.includes('Somente a equipe')) return 'Somente a equipe pode cadastrar. Saia e entre de novo.';
+  if(m.includes('entrou no site com este e-mail')) return 'Ninguém entrou no site com esse e-mail ainda. Peça para a pessoa acessar uma vez.';
+  if(m.includes('polos_nome') || m.includes('slots_rotulo_key')) return 'Já existe um cadastro com esse nome.';
   return m;
 }
 function ir(h){ location.hash = h; }
@@ -837,13 +840,17 @@ function vMentor(d){
 let adminAba='inscricoes', fPolo='todos', fStatus='todos', fBusca='';
 
 async function carregarAdmin(){
-  const [insc, turmas, polos] = await Promise.all([
+  const [insc, turmas, polos, slots, mentores, ms] = await Promise.all([
     sb.from('inscricoes').select(`id,protocolo,aluno_nome,aluno_serie,responsavel_nome,responsavel_whatsapp,responsavel_email,status,criado_em,polo_id,
         turmas!inscricoes_turma_id_fkey(numero,slots(rotulo)),polos!inscricoes_polo_id_fkey(nome,modalidade)`).order('criado_em',{ascending:false}).limit(500),
-    sb.from('turmas').select('id,numero,fase,capacidade,ocupadas,polos(nome,modalidade,cidade,uf),slots(rotulo),mentores!turmas_mentor_id_fkey(nome)').order('numero'),
-    sb.from('polos').select('id,nome').order('nome')
+    sb.from('turmas').select('id,numero,fase,capacidade,ocupadas,polo_id,polos(nome,modalidade,cidade,uf),slots(rotulo),mentores!turmas_mentor_id_fkey(nome)').order('numero'),
+    sb.from('polos').select('id,nome,modalidade,cidade,uf,valor_mensal,ativo').order('nome'),
+    sb.from('slots').select('id,rotulo,hora_inicio').order('hora_inicio'),
+    sb.from('mentores').select('id,nome,area,limite_turmas,ativo,perfil_id').order('nome'),
+    sb.from('mentor_slots').select('mentor_id,slot_id')
   ]);
-  return { insc:insc.data||[], turmas:turmas.data||[], polos:polos.data||[] };
+  return { insc:insc.data||[], turmas:turmas.data||[], polos:polos.data||[],
+           slots:slots.data||[], mentores:mentores.data||[], ms:ms.data||[] };
 }
 
 function vAdmin(d){
@@ -860,7 +867,7 @@ function vAdmin(d){
     (fStatus==='todos'||i.status===fStatus) &&
     (!q || (i.aluno_nome+i.responsavel_nome+i.protocolo).toLowerCase().includes(q)));
 
-  const corpo = adminAba==='inscricoes' ? `
+  const corpo = adminAba==='cadastros' ? vCadastros(d) : adminAba==='inscricoes' ? `
     <div class="adminFiltros">
       <input id="adBusca" placeholder="Buscar aluno, responsável ou protocolo…" value="${esc(fBusca)}">
       <select id="adPolo"><option value="todos">Todos os polos</option>
@@ -907,10 +914,230 @@ function vAdmin(d){
     <div class="kpis">${kpis.map(k=>`<div class="kpi"><b style="color:${k[2]}">${k[1]}</b><span>${k[0]}</span></div>`).join('')}</div>
     <div class="abas">
       <button class="aba ${adminAba==='inscricoes'?'on':''}" data-adab="inscricoes">Inscrições</button>
-      <button class="aba ${adminAba==='turmas'?'on':''}" data-adab="turmas">Turmas e polos</button>
+      <button class="aba ${adminAba==='turmas'?'on':''}" data-adab="turmas">Turmas</button>
+      <button class="aba ${adminAba==='cadastros'?'on':''}" data-adab="cadastros">Cadastros</button>
     </div>
     ${corpo}
   </div></section>`;
+}
+
+
+/* =====================================================================
+   ADMIN · CADASTROS
+   ===================================================================== */
+let cadForm = null;        // 'polo' | 'mentor' | 'slot' | null
+let cadSlots = [];         // horários marcados no formulário aberto
+let cadMentorEdit = null;  // mentor cujos horários estão sendo editados
+
+const DIAS_OPCOES = ['Seg e Qua','Ter e Qui','Segunda','Terça','Quarta','Quinta','Sexta','Sábado'];
+
+function chipsHorarios(slots, marcados, attr){
+  if(!slots.length) return '<div class="aviso">Nenhum horário cadastrado ainda. Crie um horário primeiro.</div>';
+  return `<div class="horGrid">${slots.map(s=>`
+    <label class="horChip ${marcados.includes(s.id)?'on':''}">
+      <input type="checkbox" ${attr}="${s.id}" ${marcados.includes(s.id)?'checked':''}>${esc(s.rotulo)}</label>`).join('')}</div>`;
+}
+
+function vCadastros(d){
+  const turmasPorPolo = {};
+  d.turmas.forEach(t=>{ turmasPorPolo[t.polo_id] = (turmasPorPolo[t.polo_id]||0)+1; });
+  const slotsPorMentor = {};
+  d.ms.forEach(x=>{ (slotsPorMentor[x.mentor_id] = slotsPorMentor[x.mentor_id]||[]).push(x.slot_id); });
+
+  const formPolo = cadForm!=='polo' ? '' : `<div class="painelVoto" style="margin-bottom:18px">
+    <h3 style="font-size:18px">Nova escola</h3>
+    <p class="sub" style="font-size:13.5px;margin-top:4px">A escola entra no ar assim que você salvar, já com a Turma 01 aberta.</p>
+    <div class="campos" style="margin-top:16px">
+      <div class="campo full"><label for="cp_nome">Nome da escola</label><input id="cp_nome" placeholder="Colégio…"></div>
+      <div class="campo"><label for="cp_mod">Modalidade</label>
+        <select id="cp_mod"><option value="presencial">Presencial</option><option value="online">Online</option></select></div>
+      <div class="campo"><label for="cp_valor">Mensalidade (R$)</label><input id="cp_valor" type="number" value="200" inputmode="numeric"></div>
+      <div class="campo"><label for="cp_cidade">Cidade</label><input id="cp_cidade"></div>
+      <div class="campo"><label for="cp_uf">Estado</label><input id="cp_uf" placeholder="MT" maxlength="2"></div>
+      <div class="campo full"><label for="cp_end">Endereço</label><input id="cp_end" placeholder="Rua, número — bairro"></div>
+    </div>
+    <h3 style="margin:20px 0 6px;font-size:16px">Horários desta escola</h3>
+    <p class="sub" style="font-size:13px">Marque na ordem em que quer preencher. A Turma 01 usa o primeiro marcado; quando fechar, a 02 abre no seguinte.</p>
+    ${chipsHorarios(d.slots, cadSlots, 'data-cadslot')}
+    <div class="acoes"><button class="btn vazio" data-cadcancel="1">Cancelar</button>
+    <button class="btn amarelo" id="btnSalvarPolo">Criar escola</button></div>
+  </div>`;
+
+  const formMentor = cadForm!=='mentor' ? '' : `<div class="painelVoto" style="margin-bottom:18px">
+    <h3 style="font-size:18px">Novo professor mentor</h3>
+    <p class="sub" style="font-size:13.5px;margin-top:4px">É este texto que as equipes leem antes de votar.</p>
+    <div class="campos" style="margin-top:16px">
+      <div class="campo full"><label for="cm_nome">Nome completo</label><input id="cm_nome"></div>
+      <div class="campo"><label for="cm_area">Área principal</label><input id="cm_area" placeholder="ex: Desenvolvimento e IA"></div>
+      <div class="campo"><label for="cm_nivel">Nível</label><input id="cm_nivel" placeholder="Mentor certificado · nível 1"></div>
+      <div class="campo full"><label for="cm_form">Formação</label><input id="cm_form"></div>
+      <div class="campo full"><label for="cm_bio">Como trabalha</label>
+        <textarea id="cm_bio" rows="3" placeholder="Duas ou três frases sobre o jeito de orientar"></textarea></div>
+      <div class="campo full"><label for="cm_dest">Destaques (um por linha, até 3)</label><textarea id="cm_dest" rows="3"></textarea></div>
+      <div class="campo"><label for="cm_lim">Limite de turmas</label>
+        <select id="cm_lim">${[2,3,4,5,6,8].map(n=>`<option value="${n}" ${n===4?'selected':''}>${n} turmas</option>`).join('')}</select></div>
+    </div>
+    <h3 style="margin:20px 0 6px;font-size:16px">Horários que pode assumir</h3>
+    ${chipsHorarios(d.slots, cadSlots, 'data-cadslot')}
+    <div class="acoes"><button class="btn vazio" data-cadcancel="1">Cancelar</button>
+    <button class="btn amarelo" id="btnSalvarMentor">Criar mentor</button></div>
+  </div>`;
+
+  const formSlot = cadForm!=='slot' ? '' : `<div class="painelVoto" style="margin-bottom:18px">
+    <h3 style="font-size:18px">Novo horário</h3>
+    <p class="sub" style="font-size:13.5px;margin-top:4px">O nome é montado sozinho, no padrão do sistema.</p>
+    <div class="campos" style="margin-top:16px">
+      <div class="campo full"><label for="cs_dias">Dias</label>
+        <select id="cs_dias">${DIAS_OPCOES.map(x=>`<option>${x}</option>`).join('')}</select></div>
+      <div class="campo"><label for="cs_ini">Começa</label><input id="cs_ini" type="time" value="14:00"></div>
+      <div class="campo"><label for="cs_fim">Termina</label><input id="cs_fim" type="time" value="15:00"></div>
+    </div>
+    <div class="acoes"><button class="btn vazio" data-cadcancel="1">Cancelar</button>
+    <button class="btn amarelo" id="btnSalvarSlot">Criar horário</button></div>
+  </div>`;
+
+  return `
+  ${formPolo}${formMentor}${formSlot}
+
+  <div class="adminTopo" style="margin-bottom:14px">
+    <h3 style="font-size:18px">Escolas e polos</h3>
+    <button class="btn amarelo peq" data-cadabrir="polo">+ Nova escola</button>
+  </div>
+  <div class="tabelaWrap"><table style="min-width:700px">
+    <thead><tr><th>Nome</th><th>Onde</th><th>Mensalidade</th><th>Turmas</th><th>Situação</th><th></th></tr></thead>
+    <tbody>${d.polos.length?d.polos.map(p=>`<tr>
+      <td><b>${esc(p.nome)}</b></td>
+      <td>${p.modalidade==='online'?'<span class="tagAo">ONLINE</span>':esc(p.cidade||'')+'/'+esc(p.uf||'')}</td>
+      <td>R$ ${Number(p.valor_mensal).toFixed(0)},00</td>
+      <td>${turmasPorPolo[p.id]||0}</td>
+      <td><span class="statusPill ${p.ativo?'st-ativa':'st-cancelada'}">${p.ativo?'No ar':'Fora do ar'}</span></td>
+      <td><button class="btn vazio peq" data-polotoggle="${p.id}|${p.ativo?'0':'1'}">${p.ativo?'Tirar do ar':'Colocar no ar'}</button></td>
+    </tr>`).join(''):'<tr><td colspan="6"><div class="vazio-msg" style="border:none">Nenhuma escola cadastrada.</div></td></tr>'}
+    </tbody></table></div>
+
+  <div class="adminTopo" style="margin:28px 0 14px">
+    <h3 style="font-size:18px">Professores mentores</h3>
+    <button class="btn amarelo peq" data-cadabrir="mentor">+ Novo mentor</button>
+  </div>
+  <div class="tabelaWrap"><table style="min-width:800px">
+    <thead><tr><th>Nome</th><th>Área</th><th>Horários</th><th>Limite</th><th>Conta</th><th>Situação</th><th></th></tr></thead>
+    <tbody>${d.mentores.length?d.mentores.map(m=>{
+      const meus=slotsPorMentor[m.id]||[];
+      return `<tr>
+      <td><b>${esc(m.nome)}</b></td>
+      <td>${esc(m.area||'')}</td>
+      <td>${meus.length}</td>
+      <td>${m.limite_turmas}</td>
+      <td>${m.perfil_id?'<span class="statusPill st-ativa">ligada</span>':`<button class="btn vazio peq" data-vincular="${m.id}">Ligar e-mail</button>`}</td>
+      <td><span class="statusPill ${m.ativo?'st-ativa':'st-cancelada'}">${m.ativo?'Ativo':'Inativo'}</span></td>
+      <td><button class="btn vazio peq" data-mentorhor="${m.id}">Horários</button>
+          <button class="btn vazio peq" data-mentortoggle="${m.id}|${m.ativo?'0':'1'}">${m.ativo?'Desativar':'Ativar'}</button></td>
+    </tr>${cadMentorEdit===m.id?`<tr><td colspan="7" style="background:var(--bg2)">
+      <div style="padding:6px 0"><b style="font-size:13.5px">Horários de ${esc(m.nome)}</b>
+      ${chipsHorarios(d.slots, meus, 'data-horm')}
+      <div style="margin-top:12px;display:flex;gap:10px">
+        <button class="btn amarelo peq" data-salvarhor="${m.id}">Salvar horários</button>
+        <button class="btn vazio peq" data-cadcancel="1">Fechar</button></div></div></td></tr>`:''}`;
+    }).join(''):'<tr><td colspan="7"><div class="vazio-msg" style="border:none">Nenhum mentor cadastrado.</div></td></tr>'}
+    </tbody></table></div>
+
+  <div class="adminTopo" style="margin:28px 0 14px">
+    <h3 style="font-size:18px">Horários disponíveis</h3>
+    <button class="btn amarelo peq" data-cadabrir="slot">+ Novo horário</button>
+  </div>
+  <div class="marcas">${d.slots.map(x=>`<span class="marcaChip">${esc(x.rotulo)}</span>`).join('') || '<span class="sub">Nenhum horário cadastrado.</span>'}</div>
+  <p class="notaMod" style="margin-top:14px">Um horário só pode ser apagado se nenhuma escola ou mentor estiver usando — por isso não há botão de excluir aqui. Se errou, crie o certo e deixe o outro sem uso.</p>`;
+}
+
+function ligarCadastros(d){
+  document.querySelectorAll('[data-cadabrir]').forEach(b=>b.onclick=()=>{
+    cadForm=b.dataset.cadabrir; cadSlots=[]; cadMentorEdit=null; render();
+  });
+  document.querySelectorAll('[data-cadcancel]').forEach(b=>b.onclick=()=>{
+    cadForm=null; cadSlots=[]; cadMentorEdit=null; render();
+  });
+  document.querySelectorAll('[data-cadslot]').forEach(cb=>cb.onchange=()=>{
+    const id=cb.dataset.cadslot;
+    if(cb.checked){ if(!cadSlots.includes(id)) cadSlots.push(id); }
+    else cadSlots=cadSlots.filter(x=>x!==id);
+    cb.closest('.horChip').classList.toggle('on', cb.checked);
+  });
+
+  const bp=$('#btnSalvarPolo');
+  if(bp) bp.onclick=async()=>{
+    const nome=$('#cp_nome').value.trim(), mod=$('#cp_mod').value;
+    if(nome.length<3){ toast('Informe o nome da escola',true); return; }
+    if(!cadSlots.length){ toast('Marque pelo menos um horário',true); return; }
+    bp.disabled=true;
+    const { error } = await sb.rpc('fn_admin_criar_polo',{
+      p_nome:nome, p_modalidade:mod,
+      p_cidade:$('#cp_cidade').value.trim(), p_uf:$('#cp_uf').value.trim().toUpperCase(),
+      p_endereco:$('#cp_end').value.trim(), p_valor:Number($('#cp_valor').value)||200,
+      p_slots:cadSlots });
+    bp.disabled=false;
+    if(error){ toast(erroSupabase(error), true); return; }
+    cacheTurmas=null; cadForm=null; cadSlots=[];
+    toast(`${nome} está no ar com a Turma 01 aberta`); render();
+  };
+
+  const bm=$('#btnSalvarMentor');
+  if(bm) bm.onclick=async()=>{
+    const nome=$('#cm_nome').value.trim();
+    if(nome.split(' ').filter(Boolean).length<2){ toast('Informe nome e sobrenome',true); return; }
+    bm.disabled=true;
+    const { error } = await sb.rpc('fn_admin_criar_mentor',{
+      p_nome:nome, p_area:$('#cm_area').value.trim(), p_nivel:$('#cm_nivel').value.trim(),
+      p_formacao:$('#cm_form').value.trim(), p_bio:$('#cm_bio').value.trim(),
+      p_destaques:$('#cm_dest').value.split('\n').map(x=>x.trim()).filter(Boolean).slice(0,3),
+      p_limite:Number($('#cm_lim').value), p_slots:cadSlots });
+    bm.disabled=false;
+    if(error){ toast(erroSupabase(error), true); return; }
+    cacheTurmas=null; cadForm=null; cadSlots=[];
+    toast(`${nome} cadastrado`); render();
+  };
+
+  const bs=$('#btnSalvarSlot');
+  if(bs) bs.onclick=async()=>{
+    bs.disabled=true;
+    const { error } = await sb.rpc('fn_admin_criar_slot',{
+      p_dias:$('#cs_dias').value, p_inicio:$('#cs_ini').value, p_fim:$('#cs_fim').value });
+    bs.disabled=false;
+    if(error){ toast(erroSupabase(error), true); return; }
+    cadForm=null; toast('Horário criado'); render();
+  };
+
+  document.querySelectorAll('[data-polotoggle]').forEach(b=>b.onclick=async()=>{
+    const [id,at]=b.dataset.polotoggle.split('|');
+    const { error } = await sb.rpc('fn_admin_ativar_polo',{p_polo:id, p_ativo:at==='1'});
+    if(error){ toast(erroSupabase(error), true); return; }
+    cacheTurmas=null; render();
+  });
+  document.querySelectorAll('[data-mentortoggle]').forEach(b=>b.onclick=async()=>{
+    const [id,at]=b.dataset.mentortoggle.split('|');
+    const { error } = await sb.rpc('fn_admin_ativar_mentor',{p_mentor:id, p_ativo:at==='1'});
+    if(error){ toast(erroSupabase(error), true); return; }
+    cacheTurmas=null; render();
+  });
+  document.querySelectorAll('[data-mentorhor]').forEach(b=>b.onclick=()=>{
+    cadMentorEdit = cadMentorEdit===b.dataset.mentorhor ? null : b.dataset.mentorhor;
+    cadForm=null; render();
+  });
+  document.querySelectorAll('[data-horm]').forEach(cb=>cb.onchange=()=>{
+    cb.closest('.horChip').classList.toggle('on', cb.checked);
+  });
+  document.querySelectorAll('[data-salvarhor]').forEach(b=>b.onclick=async()=>{
+    const ids=[...document.querySelectorAll('[data-horm]')].filter(x=>x.checked).map(x=>x.dataset.horm);
+    const { error } = await sb.rpc('fn_admin_horarios_mentor',{p_mentor:b.dataset.salvarhor, p_slots:ids});
+    if(error){ toast(erroSupabase(error), true); return; }
+    cadMentorEdit=null; cacheTurmas=null; toast(`${ids.length} horário${ids.length!==1?'s':''} salvo${ids.length!==1?'s':''}`); render();
+  });
+  document.querySelectorAll('[data-vincular]').forEach(b=>b.onclick=async()=>{
+    const email=prompt('E-mail com que o mentor já entrou no site:');
+    if(!email) return;
+    const { error } = await sb.rpc('fn_admin_vincular_mentor',{p_mentor:b.dataset.vincular, p_email:email.trim()});
+    if(error){ toast(erroSupabase(error), true); return; }
+    toast('Conta ligada — ele já vê os convites dele'); render();
+  });
 }
 
 function exportarCSV(lista){
@@ -1200,6 +1427,7 @@ function ligarAdmin(d){
   const pl=$('#adPolo'); if(pl) pl.onchange=e=>{ fPolo=e.target.value; render(); };
   const st=$('#adStatus'); if(st) st.onchange=e=>{ fStatus=e.target.value; render(); };
   const cs=$('#btnCSV'); if(cs) cs.onclick=()=>exportarCSV(d.insc);
+  if(adminAba==='cadastros') ligarCadastros(d);
   document.querySelectorAll('[data-status]').forEach(s=>s.onchange=async()=>{
     const { error } = await sb.from('inscricoes').update({status:s.value}).eq('id',s.dataset.status);
     if(error){ toast(erroSupabase(error), true); return; }
