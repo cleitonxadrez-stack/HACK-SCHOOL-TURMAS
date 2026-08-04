@@ -464,9 +464,9 @@ function vEntrar(){
 async function carregarMinhaArea(){
   const { data, error } = await sb.from('inscricoes')
     .select(`id,protocolo,aluno_nome,aluno_serie,responsavel_nome,responsavel_whatsapp,status,criado_em,turma_id,
-             turmas(id,numero,fase,capacidade,ocupadas,mentor_id,slots(rotulo),
+             turmas!inscricoes_turma_id_fkey(id,numero,fase,capacidade,ocupadas,mentor_id,slots(rotulo),
                     polos(nome,modalidade,cidade,uf,endereco,valor_mensal),
-                    mentores(nome,area))`)
+                    mentores!turmas_mentor_id_fkey(nome,area))`)
     .eq('responsavel_user_id', sessao.user.id)
     .order('criado_em',{ascending:false});
   if(error) throw error;
@@ -531,7 +531,7 @@ let clubeId = null;
 
 async function carregarClube(tid){
   const [turma, membros, apur, votaram, cands, nomes, msgs, alin, funcs, meuVoto] = await Promise.all([
-    sb.from('turmas').select('id,numero,fase,capacidade,mentor_id,slots(rotulo),polos(nome,modalidade,endereco),mentores(id,nome,area,nivel,formacao,bio,destaques)').eq('id',tid).single(),
+    sb.from('turmas').select('id,numero,fase,capacidade,mentor_id,slots(rotulo),polos(nome,modalidade,endereco),mentores!turmas_mentor_id_fkey(id,nome,area,nivel,formacao,bio,destaques)').eq('id',tid).single(),
     sb.from('inscricoes').select('id,aluno_nome,aluno_serie,responsavel_user_id').eq('turma_id',tid).neq('status','cancelada'),
     sb.rpc('fn_apuracao',{p_turma:tid}),
     sb.rpc('fn_quem_votou',{p_turma:tid}),
@@ -839,8 +839,8 @@ let adminAba='inscricoes', fPolo='todos', fStatus='todos', fBusca='';
 async function carregarAdmin(){
   const [insc, turmas, polos] = await Promise.all([
     sb.from('inscricoes').select(`id,protocolo,aluno_nome,aluno_serie,responsavel_nome,responsavel_whatsapp,responsavel_email,status,criado_em,polo_id,
-        turmas(numero,slots(rotulo)),polos(nome,modalidade)`).order('criado_em',{ascending:false}).limit(500),
-    sb.from('turmas').select('id,numero,fase,capacidade,ocupadas,polos(nome,modalidade,cidade,uf),slots(rotulo),mentores(nome)').order('numero'),
+        turmas!inscricoes_turma_id_fkey(numero,slots(rotulo)),polos!inscricoes_polo_id_fkey(nome,modalidade)`).order('criado_em',{ascending:false}).limit(500),
+    sb.from('turmas').select('id,numero,fase,capacidade,ocupadas,polos(nome,modalidade,cidade,uf),slots(rotulo),mentores!turmas_mentor_id_fkey(nome)').order('numero'),
     sb.from('polos').select('id,nome').order('nome')
   ]);
   return { insc:insc.data||[], turmas:turmas.data||[], polos:polos.data||[] };
@@ -949,11 +949,18 @@ function vIndicar(){
    ROTEADOR
    ===================================================================== */
 const app = () => $('#app');
-let ocupado = false;
+let renderSeq = 0;
+
+// Normaliza o endereço. O link de acesso por e-mail volta com o token no
+// hash (#access_token=...) — isso não é rota, e vira '#/'.
+function rotaAtual(){
+  const bruto = location.hash || '';
+  return bruto.startsWith('#/') ? bruto : '#/';
+}
 
 async function render(){
-  if(ocupado) return; ocupado = true;
-  const rota = location.hash || '#/';
+  const meu = ++renderSeq;
+  const rota = rotaAtual();
   app().innerHTML = `<div class="vista">${carregando()}</div>`;
   let html='', ligar=()=>{};
 
@@ -970,11 +977,11 @@ async function render(){
     else if(rota==='#/pronto'){ html = vPronto(); }
     else if(rota==='#/indicar'){ html = vIndicar(); ligar = ligarIndicar; }
     else if(rota==='#/entrar'){
-      if(sessao.user){ ir('#/minha-area'); ocupado=false; return render(); }
+      if(sessao.user){ ir('#/minha-area'); return; }
       html = vEntrar(); ligar = ligarEntrar;
     }
     else if(rota==='#/minha-area'){
-      if(!sessao.user){ ir('#/entrar'); ocupado=false; return render(); }
+      if(!sessao.user){ ir('#/entrar'); return; }
       const papel = sessao.perfil?.papel;
       if(papel==='admin' || papel==='coordenador'){
         const d = await carregarAdmin(); html = vAdmin(d); ligar = ()=>ligarAdmin(d);
@@ -985,8 +992,8 @@ async function render(){
       }
     }
     else if(rota==='#/clube'){
-      if(!sessao.user){ ir('#/entrar'); ocupado=false; return render(); }
-      if(!clubeId){ ir('#/minha-area'); ocupado=false; return render(); }
+      if(!sessao.user){ ir('#/entrar'); return; }
+      if(!clubeId){ ir('#/minha-area'); return; }
       const c = await carregarClube(clubeId); html = vClube(c); ligar = ()=>ligarClube(c);
     }
     else html = vHome(cacheTurmas?cacheTurmas.length:0);
@@ -997,13 +1004,15 @@ async function render(){
       <button class="btn vazio peq" onclick="location.reload()">Tentar de novo</button></div></div></section>`;
   }
 
+  if(meu !== renderSeq) return;          // um render mais novo assumiu
+  if(!html) html = vHome(cacheTurmas?cacheTurmas.length:0);
   app().innerHTML = `<div class="vista">${html}</div>`;
   window.scrollTo({top:0,behavior:'instant'});
   document.querySelectorAll('[data-ir]').forEach(b=>b.onclick=()=>ir(b.dataset.ir));
-  const sair=$('#btnSair'); if(sair) sair.onclick=async()=>{ await sb.auth.signOut(); sessao={user:null,perfil:null,mentor:null}; ir('#/'); render(); };
-  ligar();
+  const sair=$('#btnSair'); if(sair) sair.onclick=async()=>{
+    await sb.auth.signOut(); sessao={user:null,perfil:null,mentor:null}; location.hash='#/'; render(); };
+  try{ ligar(); }catch(e){ console.error('ligar()',e); }
   atualizarMenu();
-  ocupado = false;
 }
 
 function atualizarMenu(){
@@ -1209,17 +1218,38 @@ function ligarIndicar(){
 
 /* ---------- inicialização ---------- */
 sb.auth.onAuthStateChange(async (evt)=>{
-  if(evt==='SIGNED_IN' || evt==='SIGNED_OUT' || evt==='TOKEN_REFRESHED'){
-    await carregarSessao();
-    if(evt==='SIGNED_IN' && (location.hash==='#/entrar' || !location.hash)){ emailEnviado=null; ir('#/minha-area'); }
-    render();
+  if(evt!=='SIGNED_IN' && evt!=='SIGNED_OUT') return;
+  await carregarSessao();
+  emailEnviado = null;
+  const r = rotaAtual();
+  const destino = evt==='SIGNED_IN'
+    ? ((r==='#/' || r==='#/entrar') ? '#/minha-area' : r)
+    : '#/';
+  if(location.hash !== destino){ location.hash = destino; return; }  // hashchange renderiza
+  render();
+});
+
+window.addEventListener('hashchange', ()=>render());
+
+// Rede de segurança: erro solto nunca deixa a página em branco
+window.addEventListener('error', e=>{
+  console.error(e.error||e.message);
+  if(app() && !app().textContent.trim()){
+    app().innerHTML = `<section class="secao" style="border-top:none"><div class="molde">
+      <div class="vazio-msg">Algo falhou ao carregar.<br><br>
+      <button class="btn vazio peq" onclick="location.href=location.pathname+'#/'">Voltar ao início</button>
+      </div></div></section>`;
   }
 });
 
-window.addEventListener('hashchange', render);
-
 (async ()=>{
-  await carregarSessao();
-  if(sessao.user && (location.hash==='' || location.hash==='#/entrar')) ir('#/minha-area');
+  try{ await carregarSessao(); }catch(e){ console.error('sessao',e); }
+  const bruto = location.hash || '';
+  // limpa o token do link de acesso e decide onde a pessoa cai
+  if(!bruto.startsWith('#/')){
+    history.replaceState(null,'', location.pathname + (sessao.user ? '#/minha-area' : '#/'));
+  } else if(sessao.user && bruto==='#/entrar'){
+    history.replaceState(null,'', location.pathname + '#/minha-area');
+  }
   render();
 })();
